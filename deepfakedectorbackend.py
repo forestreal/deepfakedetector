@@ -1,21 +1,18 @@
 import torch
 import torch.nn as nn
-import torchvision.models as models
 from transformers import Wav2Vec2Processor, Wav2Vec2Model
 from pytube import YouTube
 from googleapiclient.discovery import build
 import sqlite3
 from statsmodels.tsa.ar_model import AutoReg
-from sklearn.metrics.pairwise import cosine_similarity
 import cv2
 import numpy as np
-import librosa
 import os
 from moviepy.editor import VideoFileClip
 import pickle
 
 # YouTube API Key (replace with your API key)
-API_KEY = "AIzaSyCe8V_9rHKplYdNkWFRa0KlWg7y6pukP5U"
+API_KEY = "YOUR_YOUTUBE_API_KEY"
 
 # Hyperparameters
 learning_rate = 0.001
@@ -67,17 +64,14 @@ class KnowledgeMap:
 # Function to download a video from YouTube using the video_id and return the file path
 def get_video_path(video_id):
     try:
-        # Download the video using pytube
         youtube_url = f"https://www.youtube.com/watch?v={video_id}"
         yt = YouTube(youtube_url)
         stream = yt.streams.filter(file_extension="mp4").first()
 
-        # Specify download directory
         download_dir = "videos"  # Folder to store videos
         if not os.path.exists(download_dir):
             os.makedirs(download_dir)
 
-        # Download the video
         video_path = stream.download(download_dir)
 
         return video_path
@@ -113,7 +107,7 @@ def extract_ar_features_from_video(frames, lag=2):
         if len(faces) > 0:
             (x, y, w, h) = faces[0]
             face_roi = frame[y:y+h, x:x+w]
-            intensity_signal = np.mean(face_roi[:, :, 1])  # Use the green channel for intensity (PPG signal)
+            intensity_signal = np.mean(face_roi[:, :, 1])
             intensity_signals.append(intensity_signal)
 
     intensity_signals = np.array(intensity_signals)
@@ -121,9 +115,9 @@ def extract_ar_features_from_video(frames, lag=2):
     if len(intensity_signals) > lag:
         model = AutoReg(intensity_signals, lags=lag)
         ar_fit = model.fit()
-        return ar_fit.params  # Return the AR coefficients
+        return ar_fit.params
     else:
-        return np.zeros(lag)  # Fallback to zeros if not enough frames
+        return np.zeros(lag)
 
 # Preprocessing function
 def preprocess_and_extract_features(video_path):
@@ -174,17 +168,17 @@ class MultimodalTransformer(nn.Module):
         self.lstm = nn.LSTM(input_size=hidden_dim, hidden_size=hidden_dim, batch_first=True, num_layers=2)
         self.transformer = nn.Transformer(d_model=hidden_dim, nhead=n_heads, num_encoder_layers=num_layers)
         self.fc = nn.Linear(hidden_dim, 1)
-        self.sigmoid = nn.Sigmoid()  # Sigmoid for binary classification
+        self.sigmoid = nn.Sigmoid()
     
     def forward(self, video_features, audio_features, ar_features, ppg_signal):
         video_proj = self.video_proj(video_features)
         audio_proj = self.audio_proj(audio_features)
         
-        multimodal_features = torch.cat([video_proj.unsqueeze(1), audio_proj.unsqueeze(1)], dim=1)  # Concatenate along sequence dimension
+        multimodal_features = torch.cat([video_proj.unsqueeze(1), audio_proj.unsqueeze(1)], dim=1)
         transformer_out = self.transformer(multimodal_features, multimodal_features)
 
         ar_ppg_combined = torch.stack([ar_features, ppg_signal], dim=-1)
-        lstm_out, _ = self.lstm(ar_ppg_combined.unsqueeze(0))  # Ensure the data is batched correctly
+        lstm_out, _ = self.lstm(ar_ppg_combined.unsqueeze(0))
         
         combined_features = transformer_out.mean(dim=0) + lstm_out[:, -1, :]
         output = self.fc(combined_features)
@@ -217,7 +211,7 @@ class GAN(nn.Module):
 # Training supervised model
 def train_supervised(model, video_ids):
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-    loss_fn = nn.BCELoss()  # Binary Cross Entropy for classification
+    loss_fn = nn.BCELoss()
     
     for epoch in range(epochs):
         for video_id in video_ids:
@@ -226,7 +220,7 @@ def train_supervised(model, video_ids):
                 video_features, audio_features, ar_features, ppg_signal = preprocess_and_extract_features(video_path)
                 optimizer.zero_grad()
                 output = model(video_features, audio_features, ar_features, ppg_signal)
-                target = torch.tensor([1.0])  # Assuming 1 is real, adjust as needed
+                target = torch.tensor([1.0])
                 loss = loss_fn(output, target)
                 loss.backward()
                 optimizer.step()
@@ -237,7 +231,7 @@ def train_supervised(model, video_ids):
 # Training GAN model
 def train_unsupervised_gan(gan_model, video_ids):
     optimizer = torch.optim.Adam(gan_model.parameters(), lr=learning_rate)
-    loss_fn = nn.BCELoss()  # Binary Cross Entropy for GAN
+    loss_fn = nn.BCELoss()
     
     for epoch in range(gan_epochs):
         for video_id in video_ids:
@@ -293,6 +287,11 @@ def user_input_and_report():
         print("Possible source videos:")
         for vid_id in video_ids:
             print(f"https://www.youtube.com/watch?v={vid_id}")
+
+# Call the user input function
+if __name__ == "__main__":
+    user_input_and_report()
+
 
 
 
