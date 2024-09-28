@@ -1,0 +1,682 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms, models
+import cv2
+import numpy as np
+import os
+from moviepy.editor import VideoFileClip
+import librosa
+import random
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+import sqlite3
+import pickle
+from transformers import AutoModel, AutoProcessor
+from statsmodels.tsa.ar_model import AutoReg
+import torch.nn.functional as F
+
+# Device configuration
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# Directory paths for the datasets (update these paths accordingly)
+FACEFORENSICS_PATH = "/Users/meenav/Downloads/FF++"
+REAL_VIDEOS_DIR = os.path.join(FACEFORENSICS_PATH, "real")  # Directory for real videos
+FAKE_VIDEOS_DIR = os.path.join(FACEFORENSICS_PATH, "fake")  # Directory for fake videos
+
+# Hyperparameters
+learning_rate = 0.0001
+batch_size = 8  # Increased batch size if memory allows
+epochs = 5  # Reduced epochs for faster training
+gan_epochs = 3  # Reduced GAN training epochs
+hidden_dim = 256  # Reduced hidden dimension
+n_heads = 4  # Reduced number of heads in Transformer
+num_layers = 2  # Reduced number of Transformer layers
+frame_sequence_length = 8  # Reduced number of frames per video to process
+num_classes = 2  # Real or Fake
+
+# Data augmentation and preprocessing transforms
+data_transforms = transforms.Compose([
+    transforms.ToPILImage(),  # Convert NumPy array to PIL Image
+    transforms.Resize((224, 224)),
+    # Disabled data augmentation to speed up training
+    # transforms.RandomHorizontalFlip(),  # Data augmentation
+    # transforms.RandomRotation(10),  # Data augmentation
+    transforms.ToTensor(),
+    transforms.Normalize([0.485, 0.456, 0.406],  # Normalization for pre-trained models
+                         [0.229, 0.224, 0.225])
+])
+
+# Initialize Wav2Vec2 model and processor for audio feature extraction
+processor = AutoProcessor.from_pretrained("facebook/wav2vec2-base-960h")
+wav2vec_model = AutoModel.from_pretrained("facebook/wav2vec2-base-960h").to(device)
+wav2vec_model.eval()  # Set to eval mode to disable training
+
+# SQLite KnowledgeMap for storing AR/PPG features
+class KnowledgeMap:
+    def __init__(self, db_path='knowledge_map.db'):
+        self.db_path = db_path  # Only store the path, not the connection
+
+    def _get_connection(self):
+        # Create a new connection each time this method is called
+        return sqlite3.connect(self.db_path)
+
+    def _create_table(self):
+        connection = self._get_connection()
+        cursor = connection.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS features (
+                video_id TEXT PRIMARY KEY,
+                ar_features BLOB,
+                ppg_features BLOB,
+                label INTEGER
+            )
+        ''')
+        connection.commit()
+        connection.close()
+
+    def store(self, video_id, ar_features, ppg_features, label):
+        ar_features_blob = pickle.dumps(ar_features)  # Serialize AR features
+        ppg_features_blob = pickle.dumps(ppg_features)  # Serialize PPG features
+        connection = self._get_connection()
+        cursor = connection.cursor()
+        cursor.execute('''
+            INSERT OR REPLACE INTO features (video_id, ar_features, ppg_features, label)
+            VALUES (?, ?, ?, ?)
+        ''', (video_id, ar_features_blob, ppg_features_blob, label))
+        connection.commit()
+        connection.close()
+
+    def retrieve_all(self):
+        connection = self._get_connection()
+        cursor = connection.cursor()
+        cursor.execute('SELECT ar_features, ppg_features, label FROM features')
+        rows = cursor.fetchall()
+        connection.close()
+        data = []
+        for row in rows:
+            ar_features = pickle.loads(row[0])
+            ppg_features = pickle.loads(row[1])
+            label = row[2]
+            data.append((ar_features, ppg_features, label))
+        return data
+
+    def close(self):
+        pass  # No need to close anything here since connections are handled per method
+
+# Function to extract frames from video
+def extract_frames(video_path, num_frames=frame_sequence_length):
+    cap = cv2.VideoCapture(video_path)
+    frames = []
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if total_frames <= 0:
+        print(f"Warning: No frames found in video {video_path}")
+        cap.release()
+        return None
+    if total_frames < num_frames:
+        frame_idxs = np.linspace(0, total_frames - 1, total_frames, dtype=int)
+    else:
+        frame_idxs = np.linspace(0, total_frames - 1, num_frames, dtype=int)
+    for idx in frame_idxs:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ret, frame = cap.read()
+        if not ret:
+            print(f"Warning: Failed to read frame {idx} from {video_path}")
+            continue
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frames.append(frame)
+    cap.release()
+    if len(frames) == 0:
+        print(f"Warning: No frames extracted from video {video_path}")
+        return None
+    return frames
+
+# Function to extract audio features using Wav2Vec2
+def extract_audio_features_from_video(video_path):
+    audio_array, sample_rate = extract_audio_with_moviepy(video_path)
+    if audio_array is None:
+        # Return zeros if no audio
+        return None  # We'll handle this in the Dataset class
+    # Convert audio signal to mono
+    if audio_array.ndim > 1:
+        audio_array = np.mean(audio_array, axis=1)
+    # Resample to 16kHz as required by Wav2Vec2
+    if sample_rate != 16000:
+        audio_array = librosa.resample(audio_array, orig_sr=sample_rate, target_sr=16000)
+        sample_rate = 16000
+    # Process audio
+    input_values = processor(audio_array, sampling_rate=sample_rate, return_tensors="pt", padding=True).input_values
+    input_values = input_values.to(device)
+    # Extract features
+    with torch.no_grad():
+        hidden_states = wav2vec_model(input_values).last_hidden_state
+    # Take mean over time dimension
+    audio_features = hidden_states.mean(dim=1).squeeze().cpu().numpy()
+    return audio_features
+
+# Extract audio from video using moviepy
+def extract_audio_with_moviepy(video_path):
+    try:
+        clip = VideoFileClip(video_path)
+        if clip.audio is None:
+            # No audio track present
+            clip.close()
+            return None, None
+        audio = clip.audio
+        sample_rate = audio.fps  # Get the sample rate
+        audio_array = audio.to_soundarray()
+        clip.close()
+        return audio_array, sample_rate
+    except Exception as e:
+        print(f"Error extracting audio from {video_path}: {e}")
+        return None, None
+
+# Function to extract PPG from video frames
+def extract_ppg_from_video(frames):
+    ppg_signals = []
+    for frame in frames:
+        # Assume face is centered and extract central region
+        h, w, _ = frame.shape
+        face_roi = frame[h//4:h*3//4, w//4:w*3//4, :]
+        green_channel = face_roi[:, :, 1]
+        ppg_signal = np.mean(green_channel)
+        ppg_signals.append(ppg_signal)
+    return np.array(ppg_signals)
+
+# Function to extract AR features from PPG signals
+def extract_ar_features_from_ppg(ppg_signals, lag=2):
+    if len(ppg_signals) > lag:
+        model = AutoReg(ppg_signals, lags=lag, old_names=False)
+        ar_fit = model.fit()
+        return ar_fit.params  # Return the AR coefficients
+    else:
+        return np.zeros(lag+1)  # Fallback to zeros if not enough frames (lag+1 for intercept)
+
+# Function to extract physiological features and store them in the knowledge map
+def extract_and_store_features(video_id, frames, knowledge_map, label):
+    ppg_signals = extract_ppg_from_video(frames)
+    ar_features = extract_ar_features_from_ppg(ppg_signals)
+    knowledge_map.store(video_id, ar_features, ppg_signals, label)
+
+# Function to extract physiological features
+def extract_physiological_features(frames):
+    # Extract PPG signals
+    ppg_signals = extract_ppg_from_video(frames)
+    # Extract AR features
+    ar_features = extract_ar_features_from_ppg(ppg_signals)
+    return ar_features, ppg_signals
+
+# Custom Dataset class for loading video data
+class DeepfakeDataset(Dataset):
+    def __init__(self, video_paths, labels, transform=None):
+        self.video_paths = video_paths
+        self.labels = labels
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.video_paths)
+
+    def __getitem__(self, idx):
+        while True:
+            try:
+                video_path = self.video_paths[idx]
+                label = self.labels[idx]
+                video_id = os.path.basename(video_path)
+                # Extract frames
+                video_frames = extract_frames(video_path)
+                if video_frames is None:
+                    print(f"Failed to extract frames from {video_path}")
+                    idx = random.randint(0, len(self.video_paths) - 1)
+                    continue
+                # Store physiological features in the knowledge map
+                knowledge_map = KnowledgeMap()
+                extract_and_store_features(video_id, video_frames, knowledge_map, label)
+                # Extract visual features
+                video_features = []
+                for frame in video_frames:
+                    if self.transform:
+                        frame = self.transform(frame)
+                    else:
+                        frame = transforms.ToTensor()(frame)
+                    video_features.append(frame)
+                video_features = torch.stack(video_features)
+                # Extract audio features
+                audio_features = extract_audio_features_from_video(video_path)
+                if audio_features is not None:
+                    audio_features = torch.tensor(audio_features, dtype=torch.float32)
+                else:
+                    audio_features = torch.zeros(768, dtype=torch.float32)  # Return zero tensor instead of None
+                # Extract AR and PPG features
+                ar_features, ppg_features = extract_physiological_features(video_frames)
+                # Convert features to tensors
+                ar_features = torch.tensor(ar_features, dtype=torch.float32)
+                ppg_features = torch.tensor(ppg_features, dtype=torch.float32)
+                return video_features, audio_features, ar_features, ppg_features, torch.tensor(label, dtype=torch.long)
+            except Exception as e:
+                print(f"Error processing video {video_path}: {e}")
+                idx = random.randint(0, len(self.video_paths) - 1)
+
+# Define the Deepfake Detection Model
+class DeepfakeDetectionModel(nn.Module):
+    def __init__(self):
+        super(DeepfakeDetectionModel, self).__init__()
+        # Use a smaller pre-trained model for visual feature extraction
+        self.resnet = models.resnet18(pretrained=True)
+        self.resnet.fc = nn.Identity()  # Remove final classification layer
+        # Freeze pre-trained layers to reduce computation
+        for param in self.resnet.parameters():
+            param.requires_grad = False
+        # LSTM for temporal modeling
+        self.lstm_visual = nn.LSTM(input_size=512, hidden_size=hidden_dim, num_layers=1, batch_first=True, bidirectional=True)
+        # Audio feature projection
+        self.audio_proj = nn.Linear(768, hidden_dim*2)
+        # AR and PPG feature projection
+        self.physio_proj = nn.Linear(4, hidden_dim*2)
+        # Transformer Encoder for multimodal fusion
+        encoder_layer = nn.TransformerEncoderLayer(d_model=hidden_dim*4, nhead=n_heads)
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        # Final classification layer
+        self.classifier = nn.Linear(hidden_dim*4, num_classes)
+
+    def forward(self, video_frames, audio_features, ar_features, ppg_features):
+        batch_size = video_frames.size(0)
+        seq_len = video_frames.size(1)
+        # Extract visual features
+        visual_features = []
+        for t in range(seq_len):
+            frame = video_frames[:, t, :, :, :]  # Shape: [batch_size, channels, height, width]
+            feat = self.resnet(frame)  # Shape: [batch_size, 512]
+            visual_features.append(feat)
+        visual_features = torch.stack(visual_features, dim=1)  # Shape: [batch_size, seq_len, 512]
+        # Temporal modeling with LSTM
+        visual_features, _ = self.lstm_visual(visual_features)  # Shape: [batch_size, seq_len, hidden_dim*2]
+        # Project audio features
+        audio_features = self.audio_proj(audio_features)  # Shape: [batch_size, hidden_dim*2]
+        audio_features = audio_features.unsqueeze(1).repeat(1, seq_len, 1)  # Align with sequence length
+        # Project physiological features
+        physio_features = torch.cat([ar_features, ppg_features.mean(dim=1).unsqueeze(1)], dim=1)  # Shape: [batch_size, 4]
+        physio_features = self.physio_proj(physio_features)  # Now works with input of size 4
+        physio_features = physio_features.unsqueeze(1).repeat(1, seq_len, 1)
+        # Combine features
+        combined_features = torch.cat([visual_features, audio_features, physio_features], dim=2)  # Shape: [batch_size, seq_len, hidden_dim*4]
+        # Transformer Encoder
+        combined_features = combined_features.permute(1, 0, 2)  # Shape: [seq_len, batch_size, hidden_dim*4]
+        transformer_output = self.transformer_encoder(combined_features)  # Shape: [seq_len, batch_size, hidden_dim*4]
+        transformer_output = transformer_output.permute(1, 0, 2)  # Shape: [batch_size, seq_len, hidden_dim*4]
+        # Classification per frame
+        logits = self.classifier(transformer_output)  # Shape: [batch_size, seq_len, num_classes]
+        # Return logits for all frames
+        return logits
+
+# GAN implementation with modifications
+class DeepfakeGAN:
+    def __init__(self):
+        # Generator and Discriminator models
+        self.generator = Generator().to(device)
+        self.discriminator = Discriminator().to(device)
+        # Adjusted learning rates
+        self.optimizer_G = optim.Adam(self.generator.parameters(), lr=0.0002)
+        self.optimizer_D = optim.Adam(self.discriminator.parameters(), lr=0.00005)
+        # Loss function
+        self.adversarial_loss = nn.BCELoss()
+
+    def train_gan(self, data_loader, num_epochs=gan_epochs):
+        noise_level = 0.05  # Noise level for discriminator inputs
+        n_generator_steps = 1  # Reduced number of generator updates per discriminator update
+
+        for epoch in range(num_epochs):
+            for i, inputs in enumerate(data_loader):
+                video_frames, _, _, _, _ = inputs
+                video_frames = video_frames.to(device)
+                batch_size = video_frames.size(0)
+                # Randomly select a frame from the sequence
+                seq_len = video_frames.size(1)
+                frame_idx = random.randint(0, seq_len - 1)
+                real_imgs = video_frames[:, frame_idx, :, :, :]
+                real_imgs = F.interpolate(real_imgs, size=(56, 56))
+
+                # Add noise to real images
+                real_imgs_noisy = real_imgs + noise_level * torch.randn_like(real_imgs)
+
+                # ---------------------
+                #  Train Discriminator
+                # ---------------------
+                self.optimizer_D.zero_grad()
+                # Sample noise as generator input
+                z = torch.randn(batch_size, 100).to(device)
+                # Generate images
+                gen_imgs = self.generator(z).detach()
+                # Add noise to generated images
+                gen_imgs_noisy = gen_imgs + noise_level * torch.randn_like(gen_imgs)
+
+                # Real and fake labels with label smoothing
+                real_labels = torch.full((batch_size, 1), 0.9, device=device)
+                fake_labels = torch.zeros(batch_size, 1, device=device)
+
+                # Discriminator loss
+                real_validity = self.discriminator(real_imgs_noisy)
+                fake_validity = self.discriminator(gen_imgs_noisy)
+                real_loss = self.adversarial_loss(real_validity, real_labels)
+                fake_loss = self.adversarial_loss(fake_validity, fake_labels)
+                d_loss = (real_loss + fake_loss) / 2
+
+                d_loss.backward()
+                self.optimizer_D.step()
+
+                # -----------------
+                #  Train Generator
+                # -----------------
+                self.optimizer_G.zero_grad()
+                # Sample noise as generator input
+                z = torch.randn(batch_size, 100).to(device)
+                # Generate images
+                gen_imgs = self.generator(z)
+                # Add noise to generated images
+                gen_imgs_noisy = gen_imgs + noise_level * torch.randn_like(gen_imgs)
+                # Generator loss
+                validity = self.discriminator(gen_imgs_noisy)
+                g_loss = self.adversarial_loss(validity, real_labels)
+
+                g_loss.backward()
+                self.optimizer_G.step()
+
+                # Break early to reduce training time
+                if i >= 10:
+                    break
+
+            print(f"Epoch [{epoch+1}/{num_epochs}]  D loss: {d_loss.item():.4f}  G loss: {g_loss.item():.4f}")
+
+# Generator model for GAN
+class Generator(nn.Module):
+    def __init__(self):
+        super(Generator, self).__init__()
+        self.model = nn.Sequential(
+            nn.Linear(100, 128*7*7),
+            nn.BatchNorm1d(128*7*7),
+            nn.ReLU(True),
+            nn.Unflatten(1, (128, 7, 7)),
+            nn.ConvTranspose2d(128, 64, 4, stride=2, padding=1),  # Output: [64, 14, 14]
+            nn.BatchNorm2d(64),
+            nn.ReLU(True),
+            nn.ConvTranspose2d(64, 32, 4, stride=2, padding=1),  # Output: [32, 28, 28]
+            nn.BatchNorm2d(32),
+            nn.ReLU(True),
+            nn.ConvTranspose2d(32, 3, 4, stride=2, padding=1),  # Output: [3, 56, 56]
+            nn.Tanh()
+        )
+
+    def forward(self, z):
+        img = self.model(z)
+        return img
+
+# Discriminator model for GAN
+class Discriminator(nn.Module):
+    def __init__(self):
+        super(Discriminator, self).__init__()
+        self.model = nn.Sequential(
+            nn.Conv2d(3, 32, 4, stride=2, padding=1),  # Output: [32, 28, 28]
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(32, 64, 4, stride=2, padding=1),  # Output: [64, 14, 14]
+            nn.BatchNorm2d(64),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(64, 128, 4, stride=2, padding=1),  # Output: [128, 7, 7]
+            nn.BatchNorm2d(128),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Flatten(),
+            nn.Linear(128*7*7, 1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, img):
+        validity = self.model(img)
+        return validity
+
+# Prepare datasets
+def prepare_datasets():
+    # Collect video paths and labels
+    real_videos = [os.path.join(REAL_VIDEOS_DIR, f) for f in os.listdir(REAL_VIDEOS_DIR) if f.endswith('.mp4')]
+    fake_videos = [os.path.join(FAKE_VIDEOS_DIR, f) for f in os.listdir(FAKE_VIDEOS_DIR) if f.endswith('.mp4')]
+    video_paths = real_videos + fake_videos
+    labels = [0]*len(real_videos) + [1]*len(fake_videos)  # 0: Real, 1: Fake
+    # Shuffle data
+    combined = list(zip(video_paths, labels))
+    random.shuffle(combined)
+    video_paths[:], labels[:] = zip(*combined)
+    # Split into training, validation, and testing sets
+    total_samples = len(video_paths)
+    train_size = int(0.7 * total_samples)
+    val_size = int(0.15 * total_samples)
+    test_size = total_samples - train_size - val_size
+    train_paths = video_paths[:train_size]
+    train_labels = labels[:train_size]
+    val_paths = video_paths[train_size:train_size+val_size]
+    val_labels = labels[train_size:train_size+val_size]
+    test_paths = video_paths[train_size+val_size:]
+    test_labels = labels[train_size+val_size:]
+    # Create datasets
+    train_dataset = DeepfakeDataset(train_paths, train_labels, transform=data_transforms)
+    val_dataset = DeepfakeDataset(val_paths, val_labels, transform=data_transforms)
+    test_dataset = DeepfakeDataset(test_paths, test_labels, transform=data_transforms)
+    return train_dataset, val_dataset, test_dataset
+
+# Training function
+def train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs=epochs):
+    best_model_wts = model.state_dict()
+    best_acc = 0.0
+    # Implement early stopping
+    patience = 2
+    patience_counter = 0
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=3, gamma=0.1)
+    for epoch in range(num_epochs):
+        print(f'Epoch {epoch+1}/{num_epochs}')
+        print('-'*10)
+        # Training phase
+        model.train()
+        running_loss = 0.0
+        running_corrects = 0
+        total_samples = 0
+        for i, inputs in enumerate(train_loader):
+            video_frames, audio_features, ar_features, ppg_features, labels = inputs
+            # Handle cases where data extraction failed
+            video_frames = video_frames.to(device)
+            ar_features = ar_features.to(device)
+            ppg_features = ppg_features.to(device)
+            labels = labels.to(device)
+            audio_features = audio_features.to(device)
+            optimizer.zero_grad()
+            outputs = model(video_frames, audio_features, ar_features, ppg_features)
+            # Since outputs are per frame, average over frames
+            outputs_avg = torch.mean(outputs, dim=1)
+            loss = criterion(outputs_avg, labels)
+            _, preds = torch.max(outputs_avg, 1)
+            loss.backward()
+            optimizer.step()
+            running_loss += loss.item() * video_frames.size(0)
+            running_corrects += torch.sum(preds == labels.data)
+            total_samples += video_frames.size(0)
+
+            # Break early to reduce training time
+            if i >= 10:
+                break
+
+        epoch_loss = running_loss / total_samples
+        epoch_acc = running_corrects.double() / total_samples
+        print(f'Train Loss: {epoch_loss:.4f} Acc: {epoch_acc:.4f}')
+        # Validation phase
+        model.eval()
+        val_running_loss = 0.0
+        val_running_corrects = 0
+        val_total_samples = 0
+        with torch.no_grad():
+            for i, inputs in enumerate(val_loader):
+                video_frames, audio_features, ar_features, ppg_features, labels = inputs
+                video_frames = video_frames.to(device)
+                ar_features = ar_features.to(device)
+                ppg_features = ppg_features.to(device)
+                labels = labels.to(device)
+                audio_features = audio_features.to(device)
+                outputs = model(video_frames, audio_features, ar_features, ppg_features)
+                outputs_avg = torch.mean(outputs, dim=1)
+                loss = criterion(outputs_avg, labels)
+                _, preds = torch.max(outputs_avg, 1)
+                val_running_loss += loss.item() * video_frames.size(0)
+                val_running_corrects += torch.sum(preds == labels.data)
+                val_total_samples += video_frames.size(0)
+
+                # Break early to reduce validation time
+                if i >= 5:
+                    break
+
+        val_loss = val_running_loss / val_total_samples
+        val_acc = val_running_corrects.double() / val_total_samples
+        print(f'Val Loss: {val_loss:.4f} Acc: {val_acc:.4f}')
+        # Early stopping
+        if val_acc > best_acc:
+            best_acc = val_acc
+            best_model_wts = model.state_dict()
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print("Early stopping triggered")
+                break
+        scheduler.step()
+    print(f'Best Val Acc: {best_acc:.4f}')
+    # Load best model weights
+    model.load_state_dict(best_model_wts)
+    return model
+
+# Evaluation function
+def evaluate_model(model, test_loader):
+    model.eval()
+    preds_list = []
+    labels_list = []
+    with torch.no_grad():
+        for inputs in test_loader:
+            video_frames, audio_features, ar_features, ppg_features, labels = inputs
+            video_frames = video_frames.to(device)
+            ar_features = ar_features.to(device)
+            ppg_features = ppg_features.to(device)
+            labels = labels.to(device)
+            audio_features = audio_features.to(device)
+            outputs = model(video_frames, audio_features, ar_features, ppg_features)
+            outputs_avg = torch.mean(outputs, dim=1)
+            _, preds = torch.max(outputs_avg, 1)
+            preds_list.extend(preds.cpu().numpy())
+            labels_list.extend(labels.cpu().numpy())
+    acc = accuracy_score(labels_list, preds_list)
+    precision = precision_score(labels_list, preds_list, zero_division=0)
+    recall = recall_score(labels_list, preds_list, zero_division=0)
+    f1 = f1_score(labels_list, preds_list, zero_division=0)
+    print(f'Test Accuracy: {acc:.4f}')
+    print(f'Test Precision: {precision:.4f}')
+    print(f'Test Recall: {recall:.4f}')
+    print(f'Test F1 Score: {f1:.4f}')
+
+# Function to compare user's video features with knowledge map using RAG
+def compare_with_knowledge_map(ar_features, ppg_features, knowledge_map):
+    data = knowledge_map.retrieve_all()
+    similarities = []
+    for stored_ar, stored_ppg, label in data:
+        # Compute cosine similarity between AR features
+        ar_sim = cosine_similarity([ar_features.cpu().numpy()], [stored_ar])[0][0]
+        # Compute correlation between PPG signals
+        if len(ppg_features) == len(stored_ppg):
+            ppg_sim = np.corrcoef(ppg_features.cpu().numpy(), stored_ppg)[0,1]
+        else:
+            min_len = min(len(ppg_features), len(stored_ppg))
+            ppg_sim = np.corrcoef(ppg_features.cpu().numpy()[:min_len], stored_ppg[:min_len])[0,1]
+        # Handle NaN values
+        if np.isnan(ppg_sim):
+            ppg_sim = 0
+        # Average the similarities
+        total_sim = (ar_sim + ppg_sim) / 2
+        similarities.append((total_sim, label))
+    # Find the most similar entries
+    similarities.sort(reverse=True)
+    top_matches = similarities[:5]  # Get top 5 matches
+    # Aggregate labels and compute confidence score
+    labels = [label for _, label in top_matches]
+    confidence_score = sum([sim for sim, _ in top_matches]) / len(top_matches)
+    predicted_label = max(set(labels), key=labels.count)
+    return predicted_label, confidence_score
+
+# Main execution
+if __name__ == "__main__":
+    # Initialize knowledge map
+    knowledge_map = KnowledgeMap()
+    knowledge_map._create_table()
+    # Prepare datasets
+    train_dataset, val_dataset, test_dataset = prepare_datasets()
+    # Data loaders with num_workers=0 to prevent SQLite issues
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0, drop_last=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=0, drop_last=True)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=0, drop_last=True)
+    # Initialize models
+    model = DeepfakeDetectionModel().to(device)
+    gan = DeepfakeGAN()
+    # Loss function and optimizer
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+    # Train the unsupervised GAN model
+    print("Training the unsupervised GAN model...")
+    # Use num_workers=0 for the DataLoader used in GAN training to avoid pickling issues
+    gan_train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0, drop_last=True)
+    gan.train_gan(gan_train_loader)
+    # Train the supervised model
+    print("Training the supervised model...")
+    model = train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs=epochs)
+    # Evaluate the model
+    evaluate_model(model, test_loader)
+    # User input for video testing
+    user_video_path = input("Please provide the path to your video: ")
+    print("Processing your video, please wait...")
+    # Prepare single sample
+    video_frames = extract_frames(user_video_path)
+    if video_frames is None:
+        print("Failed to process user video.")
+    else:
+        video_features = []
+        for frame in video_frames:
+            frame = data_transforms(frame)
+            video_features.append(frame)
+        video_features = torch.stack(video_features).unsqueeze(0).to(device)  # Add batch dimension
+        # Extract audio features
+        audio_features = extract_audio_features_from_video(user_video_path)
+        if audio_features is not None:
+            audio_features = torch.tensor(audio_features, dtype=torch.float32).unsqueeze(0).to(device)
+        else:
+            audio_features = torch.zeros((1, 768), dtype=torch.float32).to(device)
+        # Extract physiological features
+        ar_features, ppg_features = extract_physiological_features(video_frames)
+        ar_features_tensor = torch.tensor(ar_features, dtype=torch.float32).unsqueeze(0).to(device)
+        ppg_features_tensor = torch.tensor(ppg_features, dtype=torch.float32).unsqueeze(0).to(device)
+        # Make prediction using supervised model
+        model.eval()
+        with torch.no_grad():
+            outputs = model(video_features, audio_features, ar_features_tensor, ppg_features_tensor)
+            outputs_avg = torch.mean(outputs, dim=1)
+            _, preds = torch.max(outputs_avg, 1)
+            supervised_result = preds.item()
+        # Compare with knowledge map using RAG
+        predicted_label, confidence_score = compare_with_knowledge_map(ar_features_tensor.squeeze(0), ppg_features_tensor.squeeze(0), knowledge_map)
+        # Combine results from supervised and unsupervised parts
+        final_decision = "Deepfake" if (supervised_result == 1 or predicted_label == 1) else "Real"
+        # Identify frames with potential deepfake artifacts
+        frame_predictions = []
+        with torch.no_grad():
+            for i in range(outputs.size(1)):
+                frame_output = outputs[0, i, :]
+                _, frame_pred = torch.max(frame_output, 0)
+                frame_predictions.append(frame_pred.item())
+        # Generate detailed report
+        print(f"Deepfake Detection Result: {final_decision}")
+        print(f"Confidence Score: {confidence_score:.4f}")
+        deepfake_frames = [i for i, pred in enumerate(frame_predictions) if pred == 1]
+        if deepfake_frames:
+            print(f"Deepfake artifacts detected in frames: {deepfake_frames}")
+        else:
+            print("No deepfake artifacts detected in individual frames.")
+    # Close knowledge map
+    knowledge_map.close()
